@@ -463,6 +463,14 @@ async def startgame(interaction: discord.Interaction):
             ephemeral=True
         )
         return
+
+    # Check permissions
+    if not is_manager_or_mod(interaction):
+        await interaction.response.send_message(
+            "❌ You do not have permission to use this command! (Managers/Mods only)",
+            ephemeral=True
+        )
+        return
     
     game = get_game(interaction.guild.id)
     
@@ -553,6 +561,24 @@ async def players(interaction: discord.Interaction):
     await interaction.response.send_message(message)
 
 
+
+def is_manager_or_mod(interaction: discord.Interaction) -> bool:
+    """Check if the user has manager or moderator permissions."""
+    if not isinstance(interaction.user, discord.Member):
+        return False
+    
+    # Check for direct administrator permission
+    if interaction.user.guild_permissions.administrator:
+        return True
+        
+    # Check for other mod-like permissions
+    perms = interaction.user.guild_permissions
+    return (perms.manage_guild or 
+            perms.kick_members or 
+            perms.ban_members or 
+            perms.manage_roles)
+
+
 @bot.tree.command(name="eliminate", description="Mark a player as eliminated (moderator only)")
 @app_commands.describe(player="The player to eliminate")
 async def eliminate(interaction: discord.Interaction, player: discord.Member):
@@ -561,6 +587,14 @@ async def eliminate(interaction: discord.Interaction, player: discord.Member):
     if not is_in_allowed_category(interaction.channel):
         await interaction.response.send_message(
             "❌ This command can only be used in the Mafia game channels!",
+            ephemeral=True
+        )
+        return
+        
+    # Check permissions
+    if not is_manager_or_mod(interaction):
+        await interaction.response.send_message(
+            "❌ You do not have permission to use this command! (Managers/Mods only)",
             ephemeral=True
         )
         return
@@ -598,6 +632,14 @@ async def resetgame(interaction: discord.Interaction):
     if not is_in_allowed_category(interaction.channel):
         await interaction.response.send_message(
             "❌ This command can only be used in the Mafia game channels!",
+            ephemeral=True
+        )
+        return
+
+    # Check permissions
+    if not is_manager_or_mod(interaction):
+        await interaction.response.send_message(
+            "❌ You do not have permission to use this command! (Managers/Mods only)",
             ephemeral=True
         )
         return
@@ -641,6 +683,14 @@ async def resetvotes(interaction: discord.Interaction):
 @app_commands.describe(role_name="The name of the role that identifies mafia players")
 async def setrole(interaction: discord.Interaction, role_name: str):
     """Change the player role name."""
+    # Check permissions
+    if not is_manager_or_mod(interaction):
+        await interaction.response.send_message(
+            "❌ You do not have permission to use this command! (Managers/Mods only)",
+            ephemeral=True
+        )
+        return
+
     global PLAYER_ROLE_NAME
     
     # Check if the role exists
