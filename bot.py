@@ -36,12 +36,19 @@ def get_player_role(guild: discord.Guild) -> Optional[discord.Role]:
 
 
 def is_in_allowed_category(channel: discord.abc.GuildChannel) -> bool:
-    """Check if the channel is in an allowed category."""
+    """Check if the channel is in an allowed category OR is the allowed channel."""
     if not ALLOWED_CATEGORY_ID:
         return True  # No restriction if not configured
     
+    # Check if it matches the Category ID
     if hasattr(channel, 'category_id') and channel.category_id:
-        return str(channel.category_id) == ALLOWED_CATEGORY_ID
+        if str(channel.category_id) == ALLOWED_CATEGORY_ID:
+            return True
+            
+    # Check if it matches the Channel ID itself (in case user put channel ID in env)
+    if str(channel.id) == ALLOWED_CATEGORY_ID:
+        return True
+        
     return False
 
 
@@ -485,7 +492,325 @@ def is_manager_or_mod(interaction: discord.Interaction) -> bool:
             perms.ban_members or 
             perms.manage_roles)
 
-# ... (PlayerSelect, VoteView, Commands)
+class PlayerSelect(discord.ui.Select):
+    """Dropdown menu for selecting a player to vote for."""
+    
+    def __init__(self, game: GameState, voter: discord.Member, guild: discord.Guild):
+        self.game = game
+        self.voter = voter
+        
+        active_players = game.get_active_players(guild)
+        
+        options = []
+        for player in active_players:
+            if player.id != voter.id:  # Can't vote for yourself
+                options.append(discord.SelectOption(
+                    label=player.display_name,
+                    value=str(player.id),
+                    description=f"Vote for {player.display_name}"
+                ))
+        
+        if not options:
+            options = [discord.SelectOption(label="No players available", value="none")]
+        
+        super().__init__(
+            placeholder="Select a player to vote for...",
+            min_values=1,
+            max_values=1,
+            options=options
+        )
+    
+    async def callback(self, interaction: discord.Interaction):
+        if self.values[0] == "none":
+            await interaction.response.send_message("No valid players to vote for!", ephemeral=True)
+            return
+        
+        target_id = int(self.values[0])
+        target = interaction.guild.get_member(target_id)
+        
+        if not target:
+            await interaction.response.send_message("Player not found!", ephemeral=True)
+            return
+        
+        # Verify target still has the player role
+        if not has_player_role(target):
+            await interaction.response.send_message(
+                f"{target.display_name} no longer has the **{PLAYER_ROLE_NAME}** role!",
+                ephemeral=True
+            )
+            return
+        
+        # Cast the vote
+        self.game.cast_vote(self.voter.id, target.id)
+        tally = format_tally(self.game, interaction.guild)
+        
+        # Check for majority
+        majority_player_id = self.game.check_majority(interaction.guild)
+        
+        if majority_player_id and not self.game.hammer_active:
+            majority_player = interaction.guild.get_member(majority_player_id)
+            self.game.start_hammer(interaction.channel)
+            
+            await interaction.response.send_message(
+                f"🗳️ **{self.voter.display_name}** voted for **{target.display_name}**\n\n"
+                f"{tally}\n\n"
+                f"⚠️ **MAJORITY REACHED!** {majority_player.display_name if majority_player else 'Unknown'} "
+                f"has been hammered!\n"
+                f"🔨 **24-hour countdown started!** Final tally in {format_time_remaining(self.game.get_time_remaining())}.\n"
+                f"*Updates will be posted every 4 hours.*"
+            )
+        else:
+            hammer_info = ""
+            if self.game.hammer_active:
+                remaining = self.game.get_time_remaining()
+                hammer_info = f"\n\n🔨 *Hammer active! Time remaining: {format_time_remaining(remaining)}*"
+            
+            await interaction.response.send_message(
+                f"🗳️ **{self.voter.display_name}** voted for **{target.display_name}**\n\n"
+                f"{tally}{hammer_info}"
+            )
+
+
+class VoteView(discord.ui.View):
+    """View containing the player selection dropdown."""
+    
+    def __init__(self, game: GameState, voter: discord.Member, guild: discord.Guild):
+        super().__init__(timeout=60)
+        self.add_item(PlayerSelect(game, voter, guild))
+
+
+@bot.tree.command(name="vote", description="Vote for a player in the Mafia game")
+async def vote(interaction: discord.Interaction):
+    """Open a dropdown to vote for a player."""
+    # Check if in allowed category
+    if not is_in_allowed_category(interaction.channel):
+        await interaction.response.send_message(
+            "❌ This command can only be used in the Mafia game channels!",
+            ephemeral=True
+        )
+        return
+    
+    game = get_game(interaction.guild.id)
+    
+    if not game.game_active:
+        await interaction.response.send_message(
+            "❌ No game in progress! Use `/startgame` to begin.",
+            ephemeral=True
+        )
+        return
+    
+    voter = interaction.user
+    
+    # Check if voter has the player role
+    if not has_player_role(voter):
+        await interaction.response.send_message(
+            f"❌ You don't have the **{PLAYER_ROLE_NAME}** role!",
+            ephemeral=True
+        )
+        return
+    
+    # Check if voter is eliminated
+    if voter.id in game.eliminated_players:
+        await interaction.response.send_message(
+            "❌ You have been eliminated and cannot vote!",
+            ephemeral=True
+        )
+        return
+    
+    view = VoteView(game, voter, interaction.guild)
+    await interaction.response.send_message(
+        "Select a player to vote for:",
+        view=view,
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="unvote", description="Remove your current vote")
+async def unvote(interaction: discord.Interaction):
+    """Remove the user's current vote."""
+    # Check if in allowed category
+    if not is_in_allowed_category(interaction.channel):
+        await interaction.response.send_message(
+            "❌ This command can only be used in the Mafia game channels!",
+            ephemeral=True
+        )
+        return
+    
+    game = get_game(interaction.guild.id)
+    
+    if not game.game_active:
+        await interaction.response.send_message(
+            "❌ No game in progress!",
+            ephemeral=True
+        )
+        return
+    
+    voter = interaction.user
+    
+    # Check if voter has the player role
+    if not has_player_role(voter):
+        await interaction.response.send_message(
+            f"❌ You don't have the **{PLAYER_ROLE_NAME}** role!",
+            ephemeral=True
+        )
+        return
+    
+    if game.remove_vote(voter.id):
+        tally = format_tally(game, interaction.guild)
+        hammer_info = ""
+        if game.hammer_active:
+            remaining = game.get_time_remaining()
+            hammer_info = f"\n\n🔨 *Hammer active! Time remaining: {format_time_remaining(remaining)}*"
+        
+        await interaction.response.send_message(
+            f"🗳️ **{voter.display_name}** removed their vote.\n\n{tally}{hammer_info}"
+        )
+    else:
+        await interaction.response.send_message(
+            "You don't have an active vote to remove.",
+            ephemeral=True
+        )
+
+
+@bot.tree.command(name="hammer", description="Manually trigger the 24-hour hammer countdown")
+async def hammer(interaction: discord.Interaction):
+    """Manually start the hammer countdown."""
+    # Check if in allowed category
+    if not is_in_allowed_category(interaction.channel):
+        await interaction.response.send_message(
+            "❌ This command can only be used in the Mafia game channels!",
+            ephemeral=True
+        )
+        return
+    
+    game = get_game(interaction.guild.id)
+    
+    if not game.game_active:
+        await interaction.response.send_message(
+            "❌ No game in progress!",
+            ephemeral=True
+        )
+        return
+    
+    if game.hammer_active:
+        remaining = game.get_time_remaining()
+        await interaction.response.send_message(
+            f"🔨 Hammer is already active! Time remaining: {format_time_remaining(remaining)}",
+            ephemeral=True
+        )
+        return
+    
+    game.start_hammer(interaction.channel)
+    tally = format_tally(game, interaction.guild)
+    
+    await interaction.response.send_message(
+        f"🔨 **HAMMER ACTIVATED!**\n\n"
+        f"24-hour countdown started! Final tally will be posted in {format_time_remaining(game.get_time_remaining())}.\n"
+        f"*Updates will be posted every 4 hours.*\n\n"
+        f"{tally}"
+    )
+
+
+@bot.tree.command(name="tally", description="Show the current vote tally")
+async def tally(interaction: discord.Interaction):
+    """Display the current vote tally."""
+    # Check if in allowed category
+    if not is_in_allowed_category(interaction.channel):
+        await interaction.response.send_message(
+            "❌ This command can only be used in the Mafia game channels!",
+            ephemeral=True
+        )
+        return
+    
+    game = get_game(interaction.guild.id)
+    
+    if not game.game_active:
+        await interaction.response.send_message(
+            "❌ No game in progress!",
+            ephemeral=True
+        )
+        return
+    
+    tally_str = format_tally(game, interaction.guild)
+    hammer_info = ""
+    if game.hammer_active:
+        remaining = game.get_time_remaining()
+        hammer_info = f"\n\n🔨 *Hammer active! Time remaining: {format_time_remaining(remaining)}*"
+    
+    await interaction.response.send_message(f"{tally_str}{hammer_info}")
+
+
+@bot.tree.command(name="players", description="Show all players in the current game")
+async def players(interaction: discord.Interaction):
+    """List all players with the mafia player role."""
+    # Check if in allowed category
+    if not is_in_allowed_category(interaction.channel):
+        await interaction.response.send_message(
+            "❌ This command can only be used in the Mafia game channels!",
+            ephemeral=True
+        )
+        return
+    
+    game = get_game(interaction.guild.id)
+    
+    role = get_player_role(interaction.guild)
+    if not role:
+        await interaction.response.send_message(
+            f"❌ Could not find a role named **{PLAYER_ROLE_NAME}**!",
+            ephemeral=True
+        )
+        return
+    
+    all_players = get_players_with_role(interaction.guild)
+    active_players = game.get_active_players(interaction.guild)
+    eliminated = [p for p in all_players if p.id in game.eliminated_players]
+    
+    if not all_players:
+        await interaction.response.send_message(
+            f"No players with the **{PLAYER_ROLE_NAME}** role found.",
+            ephemeral=True
+        )
+        return
+    
+    active_list = "\n".join(f"• {p.display_name}" for p in active_players) if active_players else "None"
+    eliminated_list = "\n".join(f"• ~~{p.display_name}~~" for p in eliminated) if eliminated else ""
+    
+    message = f"👥 **Active Players ({len(active_players)})**\n{active_list}"
+    
+    if eliminated_list:
+        message += f"\n\n💀 **Eliminated:**\n{eliminated_list}"
+    
+    if game.game_active:
+        message += f"\n\n*Majority threshold: {game.get_majority_threshold(interaction.guild)} votes*"
+    else:
+        message += f"\n\n*Game not started. Use `/startgame` to begin.*"
+    
+    await interaction.response.send_message(message)
+
+@bot.tree.command(name="status", description="Show bot status and configuration")
+async def status(interaction: discord.Interaction):
+    """Show current bot configuration and game status."""
+    game = get_game(interaction.guild.id)
+    role = get_player_role(interaction.guild)
+    
+    role_status = f"✅ **{role.name}** ({len(role.members)} members)" if role else f"❌ Role '{PLAYER_ROLE_NAME}' not found"
+    
+    category_status = "All channels"
+    if ALLOWED_CATEGORY_ID:
+        category = interaction.guild.get_channel(int(ALLOWED_CATEGORY_ID))
+        category_status = f"**{category.name}**" if category else f"Category ID: {ALLOWED_CATEGORY_ID}"
+    
+    game_status = "🎮 Active" if game.game_active else "⏸️ Not started"
+    hammer_status = f"🔨 Active ({format_time_remaining(game.get_time_remaining())} remaining)" if game.hammer_active else "⏸️ Not active"
+    
+    await interaction.response.send_message(
+        f"**MafiaDon Bot Status**\n\n"
+        f"**Player Role:** {role_status}\n"
+        f"**Allowed Category:** {category_status}\n"
+        f"**Game Status:** {game_status}\n"
+        f"**Hammer:** {hammer_status}\n\n"
+        f"*Use `/startgame` to begin a new game.*"
+    )
 
 @bot.tree.command(name="startgame", description="Start a new Mafia game with players who have the player role")
 async def startgame(interaction: discord.Interaction):
@@ -552,11 +877,85 @@ async def startgame(interaction: discord.Interaction):
     )
 
 
-# ... (eliminate command)
-# ... (inside eliminate)
-    game.eliminate_player(player) 
-    # eliminate_player now handles DB save internally
-# ...
+@bot.tree.command(name="eliminate", description="Mark a player as eliminated (moderator only)")
+@app_commands.describe(player="The player to eliminate")
+async def eliminate(interaction: discord.Interaction, player: discord.Member):
+    """Mark a player as eliminated from the game."""
+    # Check if in allowed category
+    if not is_in_allowed_category(interaction.channel):
+        await interaction.response.send_message(
+            "❌ This command can only be used in the Mafia game channels!",
+            ephemeral=True
+        )
+        return
+        
+    # Check permissions
+    if not is_manager_or_mod(interaction):
+        await interaction.response.send_message(
+            "❌ You do not have permission to use this command! (Managers/Mods only)",
+            ephemeral=True
+        )
+        return
+    
+    game = get_game(interaction.guild.id)
+    
+    if not has_player_role(player):
+        await interaction.response.send_message(
+            f"❌ {player.display_name} doesn't have the **{PLAYER_ROLE_NAME}** role!",
+            ephemeral=True
+        )
+        return
+    
+    if player.id in game.eliminated_players:
+        await interaction.response.send_message(
+            f"❌ {player.display_name} is already eliminated!",
+            ephemeral=True
+        )
+        return
+    
+    game.eliminate_player(player) # Handles DB save
+    active_players = game.get_active_players(interaction.guild)
+    
+    await interaction.response.send_message(
+        f"💀 **{player.display_name}** has been eliminated!\n\n"
+        f"*Remaining players: {len(active_players)}*\n"
+        f"*New majority threshold: {game.get_majority_threshold(interaction.guild)} votes*"
+    )
+
+@bot.tree.command(name="setrole", description="Set the player role name (default: 'i play mafia')")
+@app_commands.describe(role_name="The name of the role that identifies mafia players")
+async def setrole(interaction: discord.Interaction, role_name: str):
+    """Change the player role name."""
+    # Check permissions
+    if not is_manager_or_mod(interaction):
+        await interaction.response.send_message(
+            "❌ You do not have permission to use this command! (Managers/Mods only)",
+            ephemeral=True
+        )
+        return
+
+    global PLAYER_ROLE_NAME
+    
+    # Check if the role exists
+    role_found = None
+    for role in interaction.guild.roles:
+        if role.name.lower() == role_name.lower():
+            role_found = role
+            break
+    
+    if not role_found:
+        await interaction.response.send_message(
+            f"⚠️ Warning: No role named **{role_name}** found in this server.\n"
+            f"Role name set anyway. Make sure to create this role!",
+            ephemeral=True
+        )
+    else:
+        PLAYER_ROLE_NAME = role_name
+        players = get_players_with_role(interaction.guild)
+        await interaction.response.send_message(
+            f"✅ Player role set to **{role_name}**!\n"
+            f"Found {len(players)} players with this role."
+        )
 
 @bot.tree.command(name="resetgame", description="Reset the current game (clears all votes and eliminations)")
 async def resetgame(interaction: discord.Interaction):
